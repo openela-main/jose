@@ -1,0 +1,112 @@
+From 6825e070ef5cdcaf815bbd99089a3a6ef8b785d7 Mon Sep 17 00:00:00 2001
+From: Sergio Correia <scorreia@redhat.com>
+Date: Thu, 23 May 2024 13:56:43 -0400
+Subject: [PATCH 2/2] Fix potential DoS issue with p2c header
+
+Unbounded p2c headers may be used to cause an application that accept
+PBES algorithms to spend a lot of resources running PBKDF2 with a very
+high number of iterations.
+
+Limit the maximum number of iterations to to 32768.
+
+Fixes: CVE-2023-50967
+
+This is a backport of https://github.com/latchset/jose/pull/154, with
+some changes to adapt the test to run during the EL8 build, which
+still uses autotools instead of meson.
+
+Signed-off-by: Sergio Correia <scorreia@redhat.com>
+---
+ lib/openssl/pbes2.c                     | 9 +++++++--
+ tests/Makefile.am                       | 2 +-
+ tests/cve-2023-50967/cve-2023-50967.jwe | 1 +
+ tests/cve-2023-50967/cve-2023-50967.jwk | 1 +
+ tests/jose-jwe-dec                      | 5 +++++
+ 5 files changed, 15 insertions(+), 3 deletions(-)
+ create mode 100644 tests/cve-2023-50967/cve-2023-50967.jwe
+ create mode 100644 tests/cve-2023-50967/cve-2023-50967.jwk
+
+diff --git a/lib/openssl/pbes2.c b/lib/openssl/pbes2.c
+index 0a2756e..b399c5d 100644
+--- a/lib/openssl/pbes2.c
++++ b/lib/openssl/pbes2.c
+@@ -25,6 +25,8 @@
+ #include <string.h>
+ 
+ #define NAMES "PBES2-HS256+A128KW", "PBES2-HS384+A192KW", "PBES2-HS512+A256KW"
++#define P2C_MIN_ITERATIONS 1000
++#define P2C_MAX_ITERATIONS 32768
+ 
+ static json_t *
+ pbkdf2(const char *alg, jose_cfg_t *cfg, const json_t *jwk, int iter,
+@@ -170,7 +172,7 @@ alg_wrap_wrp(const jose_hook_alg_t *alg, jose_cfg_t *cfg, json_t *jwe,
+     json_auto_t *hdr = NULL;
+     const char *aes = NULL;
+     json_t *h = NULL;
+-    int p2c = 10000;
++    int p2c = P2C_MAX_ITERATIONS;
+     size_t stl = 0;
+ 
+     if (!json_object_get(cek, "k") && !jose_jwk_gen(cfg, cek))
+@@ -203,7 +205,7 @@ alg_wrap_wrp(const jose_hook_alg_t *alg, jose_cfg_t *cfg, json_t *jwe,
+         json_object_set_new(h, "p2c", json_integer(p2c)) < 0)
+         return false;
+ 
+-    if (p2c < 1000)
++    if (p2c < P2C_MIN_ITERATIONS || p2c > P2C_MAX_ITERATIONS)
+         return false;
+ 
+     if (json_object_set_new(h, "p2s", jose_b64_enc(st, stl)) == -1)
+@@ -245,6 +247,9 @@ alg_wrap_unw(const jose_hook_alg_t *alg, jose_cfg_t *cfg, const json_t *jwe,
+     if (json_unpack(hdr, "{s:I}", "p2c", &p2c) == -1)
+         return false;
+ 
++    if (p2c > P2C_MAX_ITERATIONS)
++        return false;
++
+     stl = jose_b64_dec(json_object_get(hdr, "p2s"), NULL, 0);
+     if (stl < 8 || stl > sizeof(st))
+         return false;
+diff --git a/tests/Makefile.am b/tests/Makefile.am
+index cd330d7..4a3651a 100644
+--- a/tests/Makefile.am
++++ b/tests/Makefile.am
+@@ -2,7 +2,7 @@ AM_CFLAGS = @JOSE_CFLAGS@ @OPENMP_CFLAGS@ @jansson_CFLAGS@ -I$(top_srcdir) -I$(t
+ LDFLAGS += $(top_builddir)/lib/libjose.la @jansson_LIBS@ @libcrypto_LIBS@ @libssl_LIBS@
+ EXTRA_DIST = vectors
+ 
+-AM_TESTS_ENVIRONMENT=PATH=$(top_builddir)/cmd:$(PATH) VECTORS=$(top_srcdir)/tests/vectors ISSUE_75_DATADIR=$(top_srcdir)/tests/issue-75
++AM_TESTS_ENVIRONMENT=PATH=$(top_builddir)/cmd:$(PATH) VECTORS=$(top_srcdir)/tests/vectors ISSUE_75_DATADIR=$(top_srcdir)/tests/issue-75 CVE_2023_50967=$(top_srcdir)/tests/cve-2023-50967
+ TESTS = $(dist_check_SCRIPTS) $(check_PROGRAMS)
+ 
+ check_PROGRAMS = \
+diff --git a/tests/cve-2023-50967/cve-2023-50967.jwe b/tests/cve-2023-50967/cve-2023-50967.jwe
+new file mode 100644
+index 0000000..70bfc42
+--- /dev/null
++++ b/tests/cve-2023-50967/cve-2023-50967.jwe
+@@ -0,0 +1 @@
++{"ciphertext":"aaPb-JYGACs-loPwJkZewg","encrypted_key":"P1h8q8wLVxqYsZUuw6iEQTzgXVZHCsu8Eik-oqbE4AJGIDto3gb3SA","header":{"alg":"PBES2-HS256+A128KW","p2c":1000000000,"p2s":"qUQQWWkyyIqculSiC93mlg"},"iv":"Clg3JX9oNl_ck3sLSGrlgg","protected":"eyJlbmMiOiJBMTI4Q0JDLUhTMjU2In0","tag":"i7vga9tJkwRswFd7HlyD_A"}
+diff --git a/tests/cve-2023-50967/cve-2023-50967.jwk b/tests/cve-2023-50967/cve-2023-50967.jwk
+new file mode 100644
+index 0000000..d7fb1be
+--- /dev/null
++++ b/tests/cve-2023-50967/cve-2023-50967.jwk
+@@ -0,0 +1 @@
++{"alg":"PBES2-HS256+A128KW","k":"VHBLJ4-PmnqELoKbQoXuRA","key_ops":["wrapKey","unwrapKey"],"kty":"oct"}
+diff --git a/tests/jose-jwe-dec b/tests/jose-jwe-dec
+index 9b2143c..b5b4995 100755
+--- a/tests/jose-jwe-dec
++++ b/tests/jose-jwe-dec
+@@ -53,3 +53,8 @@ test "`jose jwe dec -i $prfx.12.jweg -k $prfx.12.jwk`"   == "`cat $prfx.12.pt`"
+ test "`jose jwe dec -i $prfx.13.jweg -k $prfx.13.1.jwk`" == "`cat $prfx.13.pt`"
+ test "`jose jwe dec -i $prfx.13.jweg -k $prfx.13.2.jwk`" == "`cat $prfx.13.pt`"
+ test "`jose jwe dec -i $prfx.13.jweg -k $prfx.13.3.jwk`" == "`cat $prfx.13.pt`"
++
++# CVE-2023-50967 - test originally from https://github.com/P3ngu1nW/CVE_Request/blob/main/latch-jose.md
++# This test is expected to fail quickly on patched systems.
++prfx="${CVE_2023_50967}/cve-2023-50967"
++! test "$(jose jwe dec -i $prfx.jwe -k $prfx.jwk)"
+-- 
+2.43.0
+

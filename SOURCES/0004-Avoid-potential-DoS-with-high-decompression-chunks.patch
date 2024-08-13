@@ -1,0 +1,135 @@
+From d2917d639717a9eaf401d87844ea2b78d597d917 Mon Sep 17 00:00:00 2001
+From: Sergio Arroutbi <sarroutb@redhat.com>
+Date: Mon, 1 Jul 2024 10:28:40 -0400
+Subject: [PATCH] Avoid potential DoS with high decompression chunks
+
+Backported from https://github.com/latchset/jose/pull/157
+
+Signed-off-by: Sergio Arroutbi <sarroutb@redhat.com>
+---
+ lib/hooks.h        |  2 ++
+ lib/zlib/deflate.c |  3 +++
+ tests/alg_comp.c   | 67 ++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 72 insertions(+)
+
+diff --git a/lib/hooks.h b/lib/hooks.h
+index 9da7b40..e9c78f4 100644
+--- a/lib/hooks.h
++++ b/lib/hooks.h
+@@ -20,6 +20,8 @@
+ #include <jose/jws.h>
+ #include <jose/jwe.h>
+ 
++#define MAX_COMPRESSED_SIZE (256*1024)
++
+ typedef enum {
+     JOSE_HOOK_JWK_KIND_NONE = 0,
+     JOSE_HOOK_JWK_KIND_TYPE,
+diff --git a/lib/zlib/deflate.c b/lib/zlib/deflate.c
+index 07eca0c..04ded33 100644
+--- a/lib/zlib/deflate.c
++++ b/lib/zlib/deflate.c
+@@ -113,6 +113,9 @@ def_free(jose_io_t *io)
+ static bool
+ inf_feed(jose_io_t *io, const void *in, size_t len)
+ {
++    if (len > MAX_COMPRESSED_SIZE) {
++        return false;
++    }
+     return feed(io, in, len, inflate);
+ }
+ 
+diff --git a/tests/alg_comp.c b/tests/alg_comp.c
+index fcd305c..753566b 100644
+--- a/tests/alg_comp.c
++++ b/tests/alg_comp.c
+@@ -19,6 +19,10 @@
+ #include <jose/jose.h>
+ #include <assert.h>
+ #include <string.h>
++#include <stdlib.h>
++
++static int g_high_compression_tested = 0;
++static int g_low_compression_tested = 0;
+ 
+ const struct {
+     const char *alg;
+@@ -41,6 +45,62 @@ const struct {
+     {}
+ };
+ 
++const uint32_t long_string_tests[] = {
++    2000, 200000, 10000000, 0
++};
++
++static uint8_t* get_random_string(uint32_t length)
++{
++    assert(length);
++    uint8_t* c = (uint8_t*)malloc(length*sizeof(uint8_t));
++    for (uint32_t i=0; i<length; i++) {
++        c[i] = 'A' + (random() % 26);
++    }
++    return c;
++}
++
++static void
++test_long_string(size_t inputlen) {
++    jose_io_auto_t *b = NULL;
++    jose_io_auto_t *c = NULL;
++    jose_io_auto_t *z = NULL;
++    void *buf1 = NULL;
++    void *buf2 = NULL;
++    size_t blen = 0;
++    size_t clen = 0;
++    const jose_hook_alg_t *a = jose_hook_alg_find(JOSE_HOOK_ALG_KIND_COMP, "DEF");
++    uint8_t* str = get_random_string(inputlen);
++
++    /* Test compression first. */
++    b = jose_io_malloc(NULL, &buf1, &blen);
++    assert(b);
++    z = a->comp.def(a, NULL, b);
++    assert(z);
++
++    assert(z->feed(z, str, inputlen));
++    assert(z->done(z));
++
++    /* Test decompression now */
++    c = jose_io_malloc(NULL, &buf2, &clen);
++    assert(b);
++    z = a->comp.inf(a, NULL, c);
++    assert(z);
++
++    /* If length>MAX_COMPRESSED_SIZE, it must fail due to high decompression size */
++    if(blen > MAX_COMPRESSED_SIZE) {
++        assert(!z->feed(z, buf1, blen));
++        g_high_compression_tested = 1;
++    } else {
++        assert(z->feed(z, buf1, blen));
++	g_low_compression_tested = 1;
++        /* Compare the final output with the original input. */
++        assert(clen == inputlen);
++        assert(memcmp(buf2, str, inputlen) == 0);
++    }
++    assert(z->done(z));
++    free(str);
++}
++
+ static void
+ test(const jose_hook_alg_t *a, bool iter,
+      const uint8_t *i, size_t il)
+@@ -119,5 +179,12 @@ main(int argc, char *argv[])
+              tst_inf, sizeof(tst_inf));
+     }
+ 
++    for (size_t i = 0; long_string_tests[i]; i++) {
++        test_long_string(long_string_tests[i]);
++    }
++
++    assert(1 == g_high_compression_tested);
++    assert(1 == g_low_compression_tested);
++
+     return EXIT_SUCCESS;
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,187 @@
+From 70cebe8c2f14ad9e7b8359ed53188bbd8ac3cce5 Mon Sep 17 00:00:00 2001
+From: Sergio Correia <scorreia@redhat.com>
+Date: Thu, 23 May 2024 12:34:01 -0400
+Subject: [PATCH] openssl: decode private exponent when converting jwk -> RSA
+
+We were not decoding the private exponent, and thus always passing
+NULL to RSA_set0_key() in jose_openssl_jwk_to_RSA().
+
+Fixes: #75
+
+This is a backport of https://github.com/latchset/jose/pull/76, with
+some changes to adapt the test to run during the EL8 build, which
+still uses autotools instead of meson.
+
+Signed-off-by: Sergio Correia <scorreia@redhat.com>
+---
+ configure.ac              |  1 +
+ lib/openssl/jwk.c         |  1 +
+ tests/Makefile.am         |  7 +--
+ tests/issue-75/issue-75.c | 89 +++++++++++++++++++++++++++++++++++++++
+ tests/issue-75/rsa512.pem |  9 ++++
+ 5 files changed, 104 insertions(+), 3 deletions(-)
+ create mode 100644 tests/issue-75/issue-75.c
+ create mode 100644 tests/issue-75/rsa512.pem
+
+diff --git a/configure.ac b/configure.ac
+index cf8c9a6..fb9c7b7 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -14,6 +14,7 @@ PKG_PROG_PKG_CONFIG([0.25])
+ PKG_CHECK_MODULES([zlib], [zlib])
+ PKG_CHECK_MODULES([jansson], [jansson >= 2.10])
+ PKG_CHECK_MODULES([libcrypto], [libcrypto >= 1.0.2])
++PKG_CHECK_MODULES([libssl], [libssl >= 1.0.2])
+ 
+ AC_OPENMP
+ AC_SUBST([OPENMP_CFLAGS])
+diff --git a/lib/openssl/jwk.c b/lib/openssl/jwk.c
+index 83be3a5..8fc1dd7 100644
+--- a/lib/openssl/jwk.c
++++ b/lib/openssl/jwk.c
+@@ -305,6 +305,7 @@ jose_openssl_jwk_to_RSA(jose_cfg_t *cfg, const json_t *jwk)
+ 
+     N = bn_decode_json(n);
+     E = bn_decode_json(e);
++    D = bn_decode_json(d);
+     P = bn_decode_json(p);
+     Q = bn_decode_json(q);
+     DP = bn_decode_json(dp);
+diff --git a/tests/Makefile.am b/tests/Makefile.am
+index 282463e..cd330d7 100644
+--- a/tests/Makefile.am
++++ b/tests/Makefile.am
+@@ -1,8 +1,8 @@
+ AM_CFLAGS = @JOSE_CFLAGS@ @OPENMP_CFLAGS@ @jansson_CFLAGS@ -I$(top_srcdir) -I$(top_builddir)
+-LDFLAGS += $(top_builddir)/lib/libjose.la @jansson_LIBS@
++LDFLAGS += $(top_builddir)/lib/libjose.la @jansson_LIBS@ @libcrypto_LIBS@ @libssl_LIBS@
+ EXTRA_DIST = vectors
+ 
+-AM_TESTS_ENVIRONMENT=PATH=$(top_builddir)/cmd:$(PATH) VECTORS=$(top_srcdir)/tests/vectors
++AM_TESTS_ENVIRONMENT=PATH=$(top_builddir)/cmd:$(PATH) VECTORS=$(top_srcdir)/tests/vectors ISSUE_75_DATADIR=$(top_srcdir)/tests/issue-75
+ TESTS = $(dist_check_SCRIPTS) $(check_PROGRAMS)
+ 
+ check_PROGRAMS = \
+@@ -13,7 +13,8 @@ check_PROGRAMS = \
+     alg_comp \
+     api_b64 \
+     api_jws \
+-    api_jwe
++    api_jwe \
++    issue-75/issue-75
+ 
+ dist_check_SCRIPTS = \
+     jose-alg \
+diff --git a/tests/issue-75/issue-75.c b/tests/issue-75/issue-75.c
+new file mode 100644
+index 0000000..6e266df
+--- /dev/null
++++ b/tests/issue-75/issue-75.c
+@@ -0,0 +1,89 @@
++/* vim: set tabstop=8 shiftwidth=4 softtabstop=4 expandtab smarttab colorcolumn=80: */
++/*
++ * Copyright 2020 Red Hat, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <jose/jose.h>
++#include <jose/openssl.h>
++#include <assert.h>
++#include <string.h>
++#include <sys/stat.h>
++
++#include <openssl/opensslv.h>
++#include <openssl/ssl.h>
++
++/*
++ * In this test we load a (RSA, 512-bit) PEM file asa n EVP_PKEY*, then
++ * convert it to JWK with jose_openssl_jwk_from_EVP_PKEY().
++ *
++ * Afterwards, we convert this JWK to EVP_PKEY* again, with
++ * jose_openssl_jwk_to_EVP_PKEY(), and once more convert the
++ * resulting EVP_PKEY* back to JWK with jose_openssl_jwk_from_EVP_PKEY().
++ *
++ * We then compare the two JWKs, and they should be equal.
++ */
++
++int
++main(int argc, char *argv[])
++{
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
++    SSL_library_init();
++#else
++    OPENSSL_init_ssl(0, NULL);
++#endif
++
++    const char *issue_75_data_dir = getenv("ISSUE_75_DATADIR");
++    if (!issue_75_data_dir) {
++        fprintf(stderr, "%s: ERROR: please, specify the ISSUE_75_DATADIR env variable, pointing out to the directory where the rsa512.pem used in the issue-75 test is located\n", argv[0]);
++        exit(1);
++    }
++
++    const char *datafile = "rsa512.pem";
++    if (strlen(datafile) + strlen(issue_75_data_dir + 1 /* path separator */) > PATH_MAX) {
++        fprintf(stderr, "%s: ERROR: invalid path to issue-75 data file: ISSUE_75_DATADIR is too large\n", argv[0]);
++        exit(1);
++    }
++
++    char pemfile[PATH_MAX + 1] = {};
++    snprintf(pemfile, PATH_MAX, "%s/%s", issue_75_data_dir, datafile);
++
++    struct stat s_buffer;
++    if (stat(pemfile, &s_buffer) != 0) {
++        fprintf(stderr, "%s: ERROR: data file '%s' does not seem to exist; please make sure ISSUE_75_DATADIR is correctly set\n", argv[0], pemfile);
++        exit(1);
++    }
++
++    BIO* pfile = BIO_new_file(pemfile, "r");
++    assert(pfile);
++
++    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(pfile, NULL, 0, NULL);
++    assert(pkey);
++    BIO_free(pfile);
++
++    json_auto_t* jwk = jose_openssl_jwk_from_EVP_PKEY(NULL, pkey);
++    assert(jwk);
++
++    EVP_PKEY* from_jwk = jose_openssl_jwk_to_EVP_PKEY(NULL, jwk);
++    assert(from_jwk);
++
++    json_auto_t* converted_jwk = jose_openssl_jwk_from_EVP_PKEY(NULL, from_jwk);
++    assert(converted_jwk);
++
++    EVP_PKEY_free(pkey);
++    EVP_PKEY_free(from_jwk);
++
++    assert(json_equal(jwk, converted_jwk));
++    return EXIT_SUCCESS;
++}
+diff --git a/tests/issue-75/rsa512.pem b/tests/issue-75/rsa512.pem
+new file mode 100644
+index 0000000..961ec32
+--- /dev/null
++++ b/tests/issue-75/rsa512.pem
+@@ -0,0 +1,9 @@
++-----BEGIN RSA PRIVATE KEY-----
++MIIBOgIBAAJBAMm/50Zj7HgDGBzTy6tmgeBq4jVVpbWA86ZBFgQpwOmXsRToQpCA
++K56DNzDBMOt4SIA7pF2uf9VBF3EQ7rg8H88CAwEAAQJAYK/HdsSMnzdcZvRZt1r5
++A0Q2BLl3IPUbz6GBm50nBssB2lYZqxpOL0i5MO5wt7DgPzrbwjugjUvhkSwdy+Wo
++gQIhAO1KoRRDaUufWNkzLjx+1XbZFnZRw+xN4Nz2P0JrVRO9AiEA2afqKfzaaxGg
++tnZGINhYBx8Iym9cZ2BpXdh5ZGCydHsCIBIcYhLz2jOFY/if6WWAoLZDd21sbDG6
++9/ClcsqU+pdZAiEA1zLDPkJnPidOrDjie4UL+/Z+PZC/XuKfKw9mbo2Aw9MCIB2E
++LzXkdu8W3g3ORa4jkV3na49Jiyg0VGeaAoauebo5
++-----END RSA PRIVATE KEY-----
+-- 
+2.44.0
+

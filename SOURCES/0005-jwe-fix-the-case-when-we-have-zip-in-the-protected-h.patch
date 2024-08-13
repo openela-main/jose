@@ -1,0 +1,413 @@
+From c2f52c8a063aac43161b030c36f43587985e8cf7 Mon Sep 17 00:00:00 2001
+From: Sergio Correia <scorreia@redhat.com>
+Date: Mon, 1 Jul 2024 10:30:39 -0400
+Subject: [PATCH] jwe: fix the case when we have "zip" in the protected header
+
+Backport from https://github.com/latchset/jose/pull/161
+
+When we have "zip" in the protected header, e.g.: "zip": "DEF",
+we should compress the payload before the encryption.
+
+However, as it stands, we are doing the compression after the
+encryption, which results in the jose_jwe_enc* functions
+producing JWEs that we are unable to decrypt afterwards.
+
+For the "zip" case, we do the compression now before the
+encryption, to fix this behavior.
+
+Also add some tests to exercise these scenarios, both using
+the jose_jwe_enc*/jose_jwe_dec* functions, as well as the
+command line utilities jose jwe enc / jose jwe dec.
+
+Signed-off-by: Sergio Correia <scorreia@redhat.com>
+---
+ lib/jwe.c             | 26 +++---------
+ lib/misc.c            | 58 +++++++++++++++++++++++++
+ lib/misc.h            |  6 +++
+ lib/openssl/aescbch.c |  9 +++-
+ lib/openssl/aesgcm.c  | 10 ++++-
+ tests/alg_comp.c      |  1 +
+ tests/api_jwe.c       | 99 +++++++++++++++++++++++++++++++++++++++++--
+ tests/jose-jwe-enc    |  9 ++++
+ 8 files changed, 192 insertions(+), 26 deletions(-)
+
+diff --git a/lib/jwe.c b/lib/jwe.c
+index 516245b..55b4333 100644
+--- a/lib/jwe.c
++++ b/lib/jwe.c
+@@ -275,14 +275,8 @@ jose_jwe_enc_cek_io(jose_cfg_t *cfg, json_t *jwe, const json_t *cek,
+                     jose_io_t *next)
+ {
+     const jose_hook_alg_t *alg = NULL;
+-    jose_io_auto_t *zip = NULL;
+-    json_auto_t *prt = NULL;
+     const char *h = NULL;
+     const char *k = NULL;
+-    const char *z = NULL;
+-
+-    prt = jose_b64_dec_load(json_object_get(jwe, "protected"));
+-    (void) json_unpack(prt, "{s:s}", "zip", &z);
+ 
+     if (json_unpack(jwe, "{s?{s?s}}", "unprotected", "enc", &h) < 0)
+         return NULL;
+@@ -336,19 +330,7 @@ jose_jwe_enc_cek_io(jose_cfg_t *cfg, json_t *jwe, const json_t *cek,
+     if (!encode_protected(jwe))
+         return NULL;
+ 
+-    if (z) {
+-        const jose_hook_alg_t *a = NULL;
+-
+-        a = jose_hook_alg_find(JOSE_HOOK_ALG_KIND_COMP, z);
+-        if (!a)
+-            return NULL;
+-
+-        zip = a->comp.def(a, cfg, next);
+-        if (!zip)
+-            return NULL;
+-    }
+-
+-    return alg->encr.enc(alg, cfg, jwe, cek, zip ? zip : next);
++    return alg->encr.enc(alg, cfg, jwe, cek, next);
+ }
+ 
+ void *
+@@ -463,6 +445,12 @@ jose_jwe_dec_cek(jose_cfg_t *cfg, const json_t *jwe, const json_t *cek,
+     o = jose_io_malloc(cfg, &pt, ptl);
+     d = jose_jwe_dec_cek_io(cfg, jwe, cek, o);
+     i = jose_b64_dec_io(d);
++
++    /* Here we make sure the ciphertext is not larger than our
++     * compression limit. */
++    if (zip_in_protected_header((json_t*)jwe) && ctl > MAX_COMPRESSED_SIZE)
++        return false;
++
+     if (!o || !d || !i || !i->feed(i, ct, ctl) || !i->done(i))
+         return NULL;
+ 
+diff --git a/lib/misc.c b/lib/misc.c
+index 465cd0d..1015ce4 100644
+--- a/lib/misc.c
++++ b/lib/misc.c
+@@ -18,6 +18,7 @@
+ #include "misc.h"
+ #include <jose/b64.h>
+ #include <string.h>
++#include "hooks.h"
+ 
+ bool
+ encode_protected(json_t *obj)
+@@ -42,6 +43,63 @@ zero(void *mem, size_t len)
+     memset(mem, 0, len);
+ }
+ 
++
++bool
++handle_zip_enc(json_t *json, const void *in, size_t len, void **data, size_t *datalen)
++{
++    json_t *prt = NULL;
++    char *z = NULL;
++    const jose_hook_alg_t *a = NULL;
++    jose_io_auto_t *zip = NULL;
++    jose_io_auto_t *zipdata = NULL;
++
++    prt = json_object_get(json, "protected");
++    if (prt && json_is_string(prt))
++        prt = jose_b64_dec_load(prt);
++
++    /* Check if we have "zip" in the protected header. */
++    if (json_unpack(prt, "{s:s}", "zip", &z) == -1) {
++        /* No zip. */
++        *data = (void*)in;
++        *datalen = len;
++        return true;
++    }
++
++    /* OK, we have "zip", so we should compress the payload before
++     * the encryption takes place. */
++    a = jose_hook_alg_find(JOSE_HOOK_ALG_KIND_COMP, z);
++    if (!a)
++        return false;
++
++    zipdata = jose_io_malloc(NULL, data, datalen);
++    if (!zipdata)
++        return false;
++
++    zip = a->comp.def(a, NULL, zipdata);
++    if (!zip || !zip->feed(zip, in, len) || !zip->done(zip))
++        return false;
++
++    return true;
++}
++
++bool
++zip_in_protected_header(json_t *json)
++{
++    json_t *prt = NULL;
++    char *z = NULL;
++
++    prt = json_object_get(json, "protected");
++    if (prt && json_is_string(prt))
++        prt = jose_b64_dec_load(prt);
++
++    /* Check if we have "zip" in the protected header. */
++    if (json_unpack(prt, "{s:s}", "zip", &z) == -1)
++        return false;
++
++    /* We have "zip", but let's validate the alg also. */
++    return jose_hook_alg_find(JOSE_HOOK_ALG_KIND_COMP, z) != NULL;
++}
++
+ static void __attribute__((constructor))
+ constructor(void)
+ {
+diff --git a/lib/misc.h b/lib/misc.h
+index d479d53..18e7710 100644
+--- a/lib/misc.h
++++ b/lib/misc.h
+@@ -30,3 +30,9 @@ encode_protected(json_t *obj);
+ 
+ void
+ zero(void *mem, size_t len);
++
++bool
++handle_zip_enc(json_t *jwe, const void *in, size_t len, void **data, size_t *data_len);
++
++bool
++zip_in_protected_header(json_t *jwe);
+diff --git a/lib/openssl/aescbch.c b/lib/openssl/aescbch.c
+index ce8073d..b0e6419 100644
+--- a/lib/openssl/aescbch.c
++++ b/lib/openssl/aescbch.c
+@@ -18,6 +18,7 @@
+ #include "misc.h"
+ #include <jose/b64.h>
+ #include "../hooks.h"
++#include "../misc.h"
+ 
+ #include <openssl/rand.h>
+ #include <openssl/sha.h>
+@@ -132,9 +133,13 @@ enc_feed(jose_io_t *io, const void *in, size_t len)
+     io_t *i = containerof(io, io_t, io);
+ 
+     uint8_t ct[EVP_CIPHER_CTX_block_size(i->cctx) + 1];
+-    const uint8_t *pt = in;
++    uint8_t *pt = NULL;
++    size_t ptlen = 0;
+ 
+-    for (size_t j = 0; j < len; j++) {
++    if (!handle_zip_enc(i->json, in, len, (void**)&pt, &ptlen))
++        return false;
++
++    for (size_t j = 0; j < ptlen; j++) {
+         int l = 0;
+ 
+         if (EVP_EncryptUpdate(i->cctx, ct, &l, &pt[j], 1) <= 0)
+diff --git a/lib/openssl/aesgcm.c b/lib/openssl/aesgcm.c
+index 190b469..1a88719 100644
+--- a/lib/openssl/aesgcm.c
++++ b/lib/openssl/aesgcm.c
+@@ -18,6 +18,7 @@
+ #include "misc.h"
+ #include <jose/b64.h>
+ #include "../hooks.h"
++#include "../misc.h"
+ 
+ #include <openssl/rand.h>
+ 
+@@ -103,10 +104,15 @@ static bool
+ enc_feed(jose_io_t *io, const void *in, size_t len)
+ {
+     io_t *i = containerof(io, io_t, io);
+-    const uint8_t *pt = in;
+     int l = 0;
+ 
+-    for (size_t j = 0; j < len; j++) {
++    uint8_t *pt = NULL;
++    size_t ptlen = 0;
++
++    if (!handle_zip_enc(i->json, in, len, (void**)&pt, &ptlen))
++        return false;
++
++    for (size_t j = 0; j < ptlen; j++) {
+         uint8_t ct[EVP_CIPHER_CTX_block_size(i->cctx) + 1];
+ 
+         if (EVP_EncryptUpdate(i->cctx, ct, &l, &pt[j], 1) <= 0)
+diff --git a/tests/alg_comp.c b/tests/alg_comp.c
+index 753566b..33dc32e 100644
+--- a/tests/alg_comp.c
++++ b/tests/alg_comp.c
+@@ -53,6 +53,7 @@ static uint8_t* get_random_string(uint32_t length)
+ {
+     assert(length);
+     uint8_t* c = (uint8_t*)malloc(length*sizeof(uint8_t));
++    assert(c);
+     for (uint32_t i=0; i<length; i++) {
+         c[i] = 'A' + (random() % 26);
+     }
+diff --git a/tests/api_jwe.c b/tests/api_jwe.c
+index f1d7a48..5fa4e10 100644
+--- a/tests/api_jwe.c
++++ b/tests/api_jwe.c
+@@ -19,8 +19,10 @@
+ #include <assert.h>
+ #include <string.h>
+ 
++#include "../lib/hooks.h" /* for MAX_COMPRESSED_SIZE */
++
+ static bool
+-dec(json_t *jwe, json_t *jwk)
++dec_cmp(json_t *jwe, json_t *jwk, const char* expected_data, size_t expected_len)
+ {
+     bool ret = false;
+     char *pt = NULL;
+@@ -30,10 +32,10 @@ dec(json_t *jwe, json_t *jwk)
+     if (!pt)
+         goto error;
+ 
+-    if (ptl != 4)
++    if (ptl != expected_len)
+         goto error;
+ 
+-    if (strcmp(pt, "foo") != 0)
++    if (strcmp(pt, expected_data) != 0)
+         goto error;
+ 
+     ret = true;
+@@ -43,12 +45,40 @@ error:
+     return ret;
+ }
+ 
++static bool
++dec(json_t *jwe, json_t *jwk)
++{
++    return dec_cmp(jwe, jwk, "foo", 4);
++}
++
++struct zip_test_data_t {
++    char* data;
++    size_t datalen;
++    bool expected;
++};
++
++static char*
++make_data(size_t len)
++{
++    assert(len > 0);
++
++    char *data = malloc(len);
++    assert(data);
++
++    for (size_t i = 0; i < len; i++) {
++        data[i] = 'A' + (random() % 26);
++    }
++    data[len-1] = '\0';
++    return data;
++}
++
+ int
+ main(int argc, char *argv[])
+ {
+     json_auto_t *jwke = json_pack("{s:s}", "alg", "ECDH-ES+A128KW");
+     json_auto_t *jwkr = json_pack("{s:s}", "alg", "RSA1_5");
+     json_auto_t *jwko = json_pack("{s:s}", "alg", "A128KW");
++    json_auto_t *jwkz = json_pack("{s:s, s:i}", "kty", "oct", "bytes", 16);
+     json_auto_t *set0 = json_pack("{s:[O,O]}", "keys", jwke, jwko);
+     json_auto_t *set1 = json_pack("{s:[O,O]}", "keys", jwkr, jwko);
+     json_auto_t *set2 = json_pack("{s:[O,O]}", "keys", jwke, jwkr);
+@@ -57,6 +87,7 @@ main(int argc, char *argv[])
+     assert(jose_jwk_gen(NULL, jwke));
+     assert(jose_jwk_gen(NULL, jwkr));
+     assert(jose_jwk_gen(NULL, jwko));
++    assert(jose_jwk_gen(NULL, jwkz));
+ 
+     json_decref(jwe);
+     assert((jwe = json_object()));
+@@ -98,5 +129,67 @@ main(int argc, char *argv[])
+     assert(dec(jwe, set1));
+     assert(dec(jwe, set2));
+ 
++
++    json_decref(jwe);
++    assert((jwe = json_pack("{s:{s:s,s:s,s:s,s:s}}", "protected", "alg", "A128KW", "enc", "A128GCM", "typ", "JWE", "zip", "DEF")));
++    assert(jose_jwe_enc(NULL, jwe, NULL, jwkz, "foo", 4));
++    assert(dec(jwe, jwkz));
++    assert(!dec(jwe, jwkr));
++    assert(!dec(jwe, jwko));
++    assert(!dec(jwe, set0));
++    assert(!dec(jwe, set1));
++    assert(!dec(jwe, set2));
++
++    /* Some tests with "zip": "DEF" */
++    struct zip_test_data_t zip[] = {
++        {
++            .data =  make_data(5),
++            .datalen = 5,
++            .expected = true,
++        },
++        {
++            .data =  make_data(50),
++            .datalen = 50,
++            .expected = true,
++        },
++        {
++            .data =  make_data(1000),
++            .datalen = 1000,
++            .expected = true,
++        },
++        {
++            .data =  make_data(10000000),
++            .datalen = 10000000,
++            .expected = false, /* compressed len will be ~8000000+
++                                * (i.e. > MAX_COMPRESSED_SIZE)
++                                */
++        },
++        {
++            .data =  make_data(50000),
++            .datalen = 50000,
++            .expected = true
++        },
++        {
++
++            .data = NULL
++        }
++    };
++
++    for (size_t i = 0; zip[i].data != NULL; i++) {
++        json_decref(jwe);
++        assert((jwe = json_pack("{s:{s:s,s:s,s:s,s:s}}", "protected", "alg", "A128KW", "enc", "A128GCM", "typ", "JWE", "zip", "DEF")));
++        assert(jose_jwe_enc(NULL, jwe, NULL, jwkz, zip[i].data, zip[i].datalen));
++
++        /* Now let's get the ciphertext compressed len. */
++        char *ct = NULL;
++        size_t ctl = 0;
++        assert(json_unpack(jwe, "{s:s%}", "ciphertext", &ct, &ctl) != -1);
++        /* And check our expectation is correct. */
++        assert(zip[i].expected == (ctl < MAX_COMPRESSED_SIZE));
++
++        assert(dec_cmp(jwe, jwkz, zip[i].data, zip[i].datalen) == zip[i].expected);
++        free(zip[i].data);
++        zip[i].data = NULL;
++    }
+     return EXIT_SUCCESS;
+ }
+diff --git a/tests/jose-jwe-enc b/tests/jose-jwe-enc
+index 4644aee..0091c4b 100755
+--- a/tests/jose-jwe-enc
++++ b/tests/jose-jwe-enc
+@@ -75,4 +75,13 @@ for msg in "hi" "this is a longer message that is more than one block"; do
+         echo -n "$msg" | jose jwe enc -I- -k $jwk -o $jwe
+         [ "`jose jwe dec -i $jwe -k $jwk -O-`" == "$msg" ]
+     done
++
++    # "zip": "DEF"
++    tmpl='{"kty":"oct","bytes":32}'
++    for enc in A128CBC-HS256 A192CBC-HS384 A256CBC-HS512 A128GCM A192GCM A256GCM; do
++        jose jwk gen -i "${tmpl}" -o "${jwk}"
++        zip="$(printf '{"alg":"A128KW","enc":"%s","zip":"DEF"}' "${enc}")"
++        printf '%s' "${msg}" | jose jwe enc -i "${zip}" -I- -k "${jwk}" -o "${jwe}"
++        [ "$(jose jwe dec -i "${jwe}" -k "${jwk}" -O-)" = "${msg}" ]
++    done
+ done
+-- 
+2.43.0
+

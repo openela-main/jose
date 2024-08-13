@@ -1,16 +1,23 @@
 Name:           jose
 Version:        10
-Release:        2%{?dist}
+Release:        2%{?dist}.3
 Summary:        Tools for JSON Object Signing and Encryption (JOSE)
 
 License:        ASL 2.0
 URL:            https://github.com/latchset/%{name}
 Source0:        https://github.com/latchset/%{name}/releases/download/v%{version}/%{name}-%{version}.tar.bz2
 
+Patch1: 0001-openssl-decode-private-exponent-when-converting-jwk-.patch
+Patch2: 0002-Fix-potential-DoS-issue-with-p2c-header.patch
+Patch3: 0003-Adapt-alg_comp-test-to-different-zlib-142.patch
+Patch4: 0004-Avoid-potential-DoS-with-high-decompression-chunks.patch
+Patch5: 0005-jwe-fix-the-case-when-we-have-zip-in-the-protected-h.patch
+
 BuildRequires:  pkgconfig
 BuildRequires:  jansson-devel >= 2.10
 BuildRequires:  openssl-devel
 BuildRequires:  zlib-devel
+BuildRequires:  autoconf automake libtool
 Requires: lib%{name}%{?_isa} = %{version}-%{release}
 
 %description
@@ -43,7 +50,8 @@ Obsoletes:      lib%{name}-zlib-devel < %{version}-%{release}
 This package contains development files for lib%{name}.
 
 %prep
-%setup -q
+%autosetup -p1
+autoreconf -fv --install
 
 %build
 %if 0%{?rhel}
@@ -79,6 +87,17 @@ make %{?_smp_mflags} check
 %{_mandir}/man3/jose*.3*
 
 %changelog
+* Mon Jul 01 2024 Sergio Correia <scorreia@redhat.com> - 10-2.3
+- Backport fix for CVE-2024-28176
+  Resolves: RHEL-28719
+
+* Mon Jul 01 2024 Sergio Correia <scorreia@redhat.com> - 10-2.2
+- Fix tests on s390x
+  Related: RHEL-29857
+
+* Sun Jun 30 2024 Sergio Correia <scorreia@redhat.com> - 10-2.1
+- Fixes CVE-2023-50967
+
 * Wed Feb 07 2018 Fedora Release Engineering <releng@fedoraproject.org> - 10-2
 - Rebuilt for https://fedoraproject.org/wiki/Fedora_28_Mass_Rebuild
 
