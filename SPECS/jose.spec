@@ -1,6 +1,6 @@
 Name:           jose
-Version:        11
-Release:        3%{?dist}
+Version:        14
+Release:        1%{?dist}
 Summary:        Tools for JSON Object Signing and Encryption (JOSE)
 
 License:        ASL 2.0
@@ -81,6 +81,10 @@ rm -rf %{buildroot}/%{_libdir}/lib%{name}.la
 %{_mandir}/man3/jose*.3*
 
 %changelog
+* Wed May 22 2024 Sergio Arroutbi <sarroutb@redhat.com> - 14-1
+- Rebase jose-14 upstream version
+  Resolves: #RHEL-38079
+
 * Mon Aug 09 2021 Mohan Boddu <mboddu@redhat.com> - 11-3
 - Rebuilt for IMA sigs, glibc 2.34, aarch64 flags
   Related: rhbz#1991688
